@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Browser Peer2</title>
+</head>
+<body>
+<h2>Browser Peer2</h2>
+<textarea id="messages" cols="50" rows="10" readonly></textarea><br>
+<input type="text" id="inputMessage" placeholder="Type message">
+<button id="sendBtn">Send</button>
+
+<script>
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('inputMessage');
+    const sendBtn = document.getElementById('sendBtn');
+
+    const ws = new WebSocket('ws://localhost:3000');
+    const pc = new RTCPeerConnection({
+        iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" }
+        ]
+    });
+
+    let dataChannel;
+    let pendingIceCandidates = [];
+    let isOfferReceived = false;
+
+    // Helper function to send message via WebSocket
+    function sendViaWebSocket(data) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(data));
+        } else {
+            ws.addEventListener('open', () => {
+                ws.send(JSON.stringify(data));
+            }, { once: true });
+        }
+    }
+
+    // Connection state monitoring
+    pc.onconnectionstatechange = () => {
+        appendMessage("Connection state: " + pc.connectionState);
+        console.log("PeerConnection state:", pc.connectionState);
+        if (pc.connectionState === "connected") {
+            appendMessage("✓ WebRTC connection established!");
+        } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+            appendMessage("✗ WebRTC connection failed/disconnected");
+        }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+        appendMessage("ICE connection state: " + pc.iceConnectionState);
+        console.log("ICE connection state:", pc.iceConnectionState);
+        if (pc.iceConnectionState === "connected") {
+            appendMessage("✓ ICE connection established!");
+        } else if (pc.iceConnectionState === "failed") {
+            appendMessage("✗ ICE connection failed - check network/firewall");
+        }
+    };
+
+    pc.onicegatheringstatechange = () => {
+        appendMessage("ICE gathering state: " + pc.iceGatheringState);
+        console.log("ICE gathering state:", pc.iceGatheringState);
+    };
+
+    // Коли приходить DataChannel
+    pc.ondatachannel = (event) => {
+        appendMessage("✓ DataChannel received from peer!");
+        dataChannel = event.channel;
+        appendMessage("DataChannel initial state: " + dataChannel.readyState);
+        dataChannel.onopen = () => {
+            appendMessage("✓ DataChannel opened!");
+            console.log("DataChannel opened, readyState:", dataChannel.readyState);
+        };
+        dataChannel.onmessage = (e) => appendMessage("Peer2 received: " + e.data);
+        dataChannel.onerror = (e) => {
+            appendMessage("DataChannel error: " + e);
+            console.error("DataChannel error:", e);
+        };
+        dataChannel.onclose = () => {
+            appendMessage("DataChannel closed");
+            console.log("DataChannel closed");
+        };
+        dataChannel.onbufferedamountlow = () => {
+            appendMessage("DataChannel buffer low");
+        };
+    };
+
+    // ICE candidates
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            sendViaWebSocket({ ice: event.candidate });
+        } else {
+            appendMessage("ICE gathering complete");
+            console.log("ICE gathering complete");
+        }
+    };
+
+    // Обробка сигналів
+    ws.onmessage = async (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            console.log("Received message:", msg);
+            
+            // Handle peer-ready signal (not used by browser, but handle gracefully)
+            if (msg.type === 'peer-ready') {
+                appendMessage("✓ Another peer is ready!");
+                return;
+            }
+            
+            appendMessage("📨 Received: " + (msg.sdp ? `SDP ${msg.sdp.type}` : msg.ice ? "ICE" : "unknown"));
+
+            if (msg.sdp) {
+                appendMessage("Processing SDP: " + msg.sdp.type);
+                try {
+                    await pc.setRemoteDescription(msg.sdp);
+                    appendMessage("✓ Set remote description: " + msg.sdp.type);
+                } catch (e) {
+                    appendMessage("✗ Error setting remote description: " + e.message);
+                    console.error("Error setting remote description:", e);
+                    return;
+                }
+                
+                // Add any pending ICE candidates
+                while (pendingIceCandidates.length > 0) {
+                    const candidate = pendingIceCandidates.shift();
+                    try {
+                        await pc.addIceCandidate(candidate);
+                    } catch(e) {
+                        console.error("Error adding pending ICE candidate:", e);
+                    }
+                }
+                
+                if (msg.sdp.type === "offer") {
+                    isOfferReceived = true;
+                    appendMessage("✓✓✓ OFFER RECEIVED! ✓✓✓");
+                    appendMessage("Creating answer...");
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    appendMessage("✓ Answer created");
+                    console.log("Answer created:", answer);
+                    
+                    // Wait for ICE gathering, then send answer
+                    const checkAndSend = () => {
+                        if (pc.iceGatheringState === "complete") {
+                            sendViaWebSocket({ sdp: pc.localDescription });
+                            appendMessage("✓✓✓ ANSWER SENT ✓✓✓");
+                            console.log("Answer sent:", pc.localDescription);
+                        } else if (pc.iceGatheringState === "gathering") {
+                            setTimeout(checkAndSend, 100);
+                        } else {
+                            setTimeout(checkAndSend, 50);
+                        }
+                    };
+                    
+                    setTimeout(checkAndSend, 200);
+                }
+            }
+
+            if (msg.ice) {
+                try {
+                    if (pc.remoteDescription) {
+                        await pc.addIceCandidate(msg.ice);
+                        appendMessage("✓ Added ICE candidate");
+                    } else {
+                        pendingIceCandidates.push(msg.ice);
+                        appendMessage("⏳ Stored ICE candidate (waiting for remote description)");
+                    }
+                } catch(e) {
+                    console.error("Error adding ICE candidate:", e);
+                    appendMessage("✗ Error adding ICE candidate: " + e.message);
+                }
+            }
+        } catch (error) {
+            console.error("Error processing message:", error);
+            appendMessage("✗ Error: " + error.message);
+        }
+    };
+
+    ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+        appendMessage("WebSocket error");
+    };
+
+    ws.onclose = () => {
+        appendMessage("WebSocket closed");
+        console.log("WebSocket closed");
+    };
+
+    ws.onopen = () => {
+        appendMessage("WebSocket connected");
+        console.log("WebSocket connected, readyState:", ws.readyState);
+        // Send ready signal
+        sendViaWebSocket({ type: 'ready' });
+        appendMessage("Sent ready signal to server");
+        appendMessage("Waiting for offer...");
+    };
+
+    // Відправка повідомлень
+    sendBtn.onclick = () => {
+        if (dataChannel && dataChannel.readyState === "open") {
+            const msg = inputEl.value;
+            dataChannel.send(msg);
+            appendMessage("Peer2 sent: " + msg);
+            inputEl.value = '';
+        } else {
+            appendMessage("Cannot send: DataChannel not open (state: " + (dataChannel ? dataChannel.readyState : "null") + ")");
+            appendMessage("Connection state: " + pc.connectionState);
+            appendMessage("ICE state: " + pc.iceConnectionState);
+        }
+    };
+
+    function appendMessage(msg) {
+        messagesEl.value += msg + "\n";
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+</script>
+</body>
+</html>
